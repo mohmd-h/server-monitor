@@ -6,7 +6,7 @@
 #   curl -fsSL ... | sudo REPO=user/repo bash
 set -euo pipefail
 
-REPO="${REPO:-YOUR_USER/YOUR_REPO}"
+REPO="${REPO:-mohmd-h/server-monitor}"
 BRANCH="${BRANCH:-main}"
 DIR="${DIR:-/opt/server-monitor}"
 SERVICE="server-monitor"
