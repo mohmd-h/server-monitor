@@ -10,7 +10,7 @@ Ultra-lightweight server monitoring panel (Python 3 only, zero dependencies).
 - Open the page any time: "Live" tab + history for 1 hour up to 30 days.
 
 Usage:    python3 monitor.py
-Optional: python3 monitor.py --port 8080 --token abc123 --days 30 --interval 10
+Optional: python3 monitor.py --port 8080 --token abc123 --days 30 --interval 10 --iface eth0
 """
 import argparse, json, os, random, secrets, socket, threading, time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -20,6 +20,26 @@ BASE = os.path.dirname(os.path.abspath(__file__))
 SKIP_PREFIX = ("lo", "veth", "docker", "br-", "virbr", "tun", "tap")
 RANGES = {"1h": 3600, "6h": 21600, "24h": 86400, "7d": 604800, "30d": 2592000}
 DATA_PATH = os.path.join(BASE, "monitor_history.csv")
+NET_IFACE = "auto"   # "auto" = the interface of the default route (the public IP); or a fixed name such as eth0
+
+
+def main_iface(names):
+    """Interface whose traffic is counted in the totals and in the history."""
+    if NET_IFACE != "auto":
+        return NET_IFACE
+    best = None
+    try:
+        for line in read("/proc/net/route").splitlines()[1:]:
+            f = line.split()
+            if f[1] == "00000000" and f[0] in names:      # default route
+                m = int(f[6])
+                if best is None or m < best[0]:
+                    best = (m, f[0])
+    except Exception:
+        pass
+    if best:
+        return best[1]
+    return "eth0" if "eth0" in names else (sorted(names)[0] if names else "")
 
 
 def read(path):
@@ -37,17 +57,16 @@ def stats():
         if k in ("MemTotal", "MemAvailable", "SwapTotal", "SwapFree"):
             m[k] = int(v.split()[0]) * 1024
 
-    ifaces, rx_t, tx_t = {}, 0, 0
+    ifaces = {}
     for line in read("/proc/net/dev").splitlines()[2:]:
         name, data = line.split(":", 1)
         name = name.strip()
         if name.startswith(SKIP_PREFIX):
             continue
         f = data.split()
-        rx, tx = int(f[0]), int(f[8])
-        ifaces[name] = [rx, tx]
-        rx_t += rx
-        tx_t += tx
+        ifaces[name] = [int(f[0]), int(f[8])]
+    main_if = main_iface(list(ifaces))
+    rx_t, tx_t = ifaces.get(main_if, [0, 0])
 
     st = os.statvfs("/")
     disk = [st.f_blocks * st.f_frsize, (st.f_blocks - st.f_bavail) * st.f_frsize]
@@ -56,7 +75,7 @@ def stats():
         "t": time.time(),
         "cpu": cpu,
         "mem": m,
-        "net": {"rx": rx_t, "tx": tx_t, "ifaces": ifaces},
+        "net": {"rx": rx_t, "tx": tx_t, "iface": main_if, "ifaces": ifaces},
         "load": read("/proc/loadavg").split()[:3],
         "uptime": float(read("/proc/uptime").split()[0]),
         "cores": os.cpu_count(),
@@ -96,11 +115,11 @@ def sampler(path, interval, days):
                 cpu = (1 - dI / dT) * 100 if dT > 0 else 0.0
                 ram = (1 - s["mem"]["MemAvailable"] / s["mem"]["MemTotal"]) * 100
                 rx = tx = 0
-                for k, v in s["net"]["ifaces"].items():  # only count interfaces that existed in the previous sample
-                    if k in prev["net"]["ifaces"]:
-                        o = prev["net"]["ifaces"][k]
-                        rx += max(0, v[0] - o[0])
-                        tx += max(0, v[1] - o[1])
+                k = s["net"]["iface"]   # only the main (public) interface is counted
+                if k in prev["net"]["ifaces"] and k in s["net"]["ifaces"]:
+                    o, v = prev["net"]["ifaces"][k], s["net"]["ifaces"][k]
+                    rx = max(0, v[0] - o[0])
+                    tx = max(0, v[1] - o[1])
                 acc.append((cpu, ram, rx, tx, dt))
             prev = s
             cur = int(s["t"] // 60)
@@ -276,7 +295,7 @@ async function tick(){
  $('dsk').textContent=(d.disk[1]/d.disk[0]*100).toFixed(1)+'%';
  $('tot').textContent=B(d.net.rx+d.net.tx);$('totd').textContent='↓ '+B(d.net.rx)+'   ↑ '+B(d.net.tx);
  $('rxt').textContent='Total: '+B(d.net.rx);$('txt').textContent='Total: '+B(d.net.tx);
- $('tb').innerHTML='<tr><th>iface</th><th>↓ RX</th><th>↑ TX</th></tr>'+Object.entries(d.net.ifaces).map(([k,v])=>`<tr><td>${k}</td><td>${B(v[0])}</td><td>${B(v[1])}</td></tr>`).join('');
+ $('tb').innerHTML='<tr><th>iface</th><th>↓ RX</th><th>↑ TX</th></tr>'+Object.entries(d.net.ifaces).map(([k,v])=>`<tr><td>${k}${k===d.net.iface?' ★ (counted)':''}</td><td>${B(v[0])}</td><td>${B(v[1])}</td></tr>`).join('');
  push('ram',used/m.MemTotal*100);
  if(prev){const dt=d.t-prev.t,dT=d.cpu[0]-prev.cpu[0],dI=d.cpu[1]-prev.cpu[1];
   const cpu=dT>0?(1-dI/dT)*100:0,rx=(d.net.rx-prev.net.rx)/dt,tx=(d.net.tx-prev.net.tx)/dt;
@@ -336,7 +355,7 @@ def local_ip():
 
 
 def main():
-    global DATA_PATH
+    global DATA_PATH, NET_IFACE
     ap = argparse.ArgumentParser()
     ap.add_argument("--port", type=int, default=0)
     ap.add_argument("--token", default="")
@@ -344,6 +363,7 @@ def main():
     ap.add_argument("--interval", type=int, default=10, help="sampling interval in seconds")
     ap.add_argument("--days", type=int, default=30, help="how many days of history to keep")
     ap.add_argument("--data", default=DATA_PATH, help="path of the history file")
+    ap.add_argument("--iface", default="", help="interface to count (default: auto = interface of the default route, e.g. eth0)")
     a = ap.parse_args()
     DATA_PATH = a.data
 
@@ -354,6 +374,7 @@ def main():
     except Exception:
         cfg = {}
 
+    NET_IFACE = a.iface or cfg.get("iface") or "auto"
     token = a.token or cfg.get("token") or secrets.token_urlsafe(9)
     handler = make_handler(token)
     srv = None
@@ -379,7 +400,7 @@ def main():
 
     try:
         with open(cfg_path, "w") as f:
-            json.dump({"port": port, "token": token}, f)
+            json.dump({"port": port, "token": token, **({"iface": NET_IFACE} if NET_IFACE != "auto" else {})}, f)
         os.chmod(cfg_path, 0o600)
     except OSError:
         pass
